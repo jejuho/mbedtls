@@ -34,7 +34,7 @@
 
 #if !defined(unix) && !defined(__unix__) && !defined(__unix) && \
     !defined(__APPLE__) && !defined(_WIN32) && !defined(__QNXNTO__) && \
-    !defined(__HAIKU__)
+    !defined(__HAIKU__) && !defined(__amiga__)
 #error "This module only works on Unix and Windows, see MBEDTLS_NET_C in config.h"
 #endif
 
@@ -91,6 +91,8 @@ static int wsa_init_done = 0;
 #include <netdb.h>
 #include <errno.h>
 
+//#include <interfaces/bsdsocket.h>
+
 #define IS_EINTR( ret ) ( ( ret ) == EINTR )
 
 #endif /* ( _WIN32 || _WIN32_WCE ) && !EFIX64 && !EFI32 */
@@ -127,7 +129,7 @@ static int net_prepare( void )
     }
 #else
 #if !defined(EFIX64) && !defined(EFI32)
-    signal( SIGPIPE, SIG_IGN );
+    //signal( SIGPIPE, SIG_IGN );
 #endif
 #endif
     return( 0 );
@@ -148,43 +150,48 @@ int mbedtls_net_connect( mbedtls_net_context *ctx, const char *host,
                          const char *port, int proto )
 {
     int ret;
-    struct addrinfo hints, *addr_list, *cur;
+    struct hostent * hn;
+    struct sockaddr_in remotehost;
+    unsigned int i = 0;
 
     if( ( ret = net_prepare() ) != 0 )
         return( ret );
 
-    /* Do name resolution with both IPv6 and IPv4 */
-    memset( &hints, 0, sizeof( hints ) );
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = proto == MBEDTLS_NET_PROTO_UDP ? SOCK_DGRAM : SOCK_STREAM;
-    hints.ai_protocol = proto == MBEDTLS_NET_PROTO_UDP ? IPPROTO_UDP : IPPROTO_TCP;
+    /* Do name resolution with IPv4 */
+    hn = gethostbyname(host);
 
-    if( getaddrinfo( host, port, &hints, &addr_list ) != 0 )
+    if(hn == NULL) {
         return( MBEDTLS_ERR_NET_UNKNOWN_HOST );
+    }
 
     /* Try the sockaddrs until a connection succeeds */
-    ret = MBEDTLS_ERR_NET_UNKNOWN_HOST;
-    for( cur = addr_list; cur != NULL; cur = cur->ai_next )
-    {
-        ctx->fd = (int) socket( cur->ai_family, cur->ai_socktype,
-                            cur->ai_protocol );
+    ret = MBEDTLS_ERR_NET_UNKNOWN_HOST;    
+    while( hn->h_addr_list[i] != NULL ) {
+        ctx->fd = (int) socket(AF_INET, proto == MBEDTLS_NET_PROTO_UDP ? SOCK_DGRAM : SOCK_STREAM,
+                                proto == MBEDTLS_NET_PROTO_UDP ? IPPROTO_UDP : IPPROTO_TCP);
         if( ctx->fd < 0 )
         {
             ret = MBEDTLS_ERR_NET_SOCKET_FAILED;
+            i++;
             continue;
         }
 
-        if( connect( ctx->fd, cur->ai_addr, MSVC_INT_CAST cur->ai_addrlen ) == 0 )
+        memcpy(&remotehost.sin_addr, hn->h_addr_list[i], hn->h_length);
+        remotehost.sin_family = AF_INET;        
+        remotehost.sin_port = htons(atoi(port));
+
+        if( connect( ctx->fd, (struct sockaddr *) &remotehost, MSVC_INT_CAST sizeof(remotehost) ) == 0 )
         {
             ret = 0;
             break;
+        } else {
+            mbedtls_printf("errno: %d\n", errno);
         }
 
         close( ctx->fd );
         ret = MBEDTLS_ERR_NET_CONNECT_FAILED;
+        i++;
     }
-
-    freeaddrinfo( addr_list );
 
     return( ret );
 }
@@ -195,67 +202,63 @@ int mbedtls_net_connect( mbedtls_net_context *ctx, const char *host,
 int mbedtls_net_bind( mbedtls_net_context *ctx, const char *bind_ip, const char *port, int proto )
 {
     int n, ret;
-    struct addrinfo hints, *addr_list, *cur;
+    struct sockaddr_in remotehost;    
 
     if( ( ret = net_prepare() ) != 0 )
         return( ret );
 
-    /* Bind to IPv6 and/or IPv4, but only in the desired protocol */
-    memset( &hints, 0, sizeof( hints ) );
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = proto == MBEDTLS_NET_PROTO_UDP ? SOCK_DGRAM : SOCK_STREAM;
-    hints.ai_protocol = proto == MBEDTLS_NET_PROTO_UDP ? IPPROTO_UDP : IPPROTO_TCP;
-    if( bind_ip == NULL )
-        hints.ai_flags = AI_PASSIVE;
-
-    if( getaddrinfo( bind_ip, port, &hints, &addr_list ) != 0 )
-        return( MBEDTLS_ERR_NET_UNKNOWN_HOST );
-
+    /* Bind to IPv4, but only in the desired protocol */    
+    
     /* Try the sockaddrs until a binding succeeds */
     ret = MBEDTLS_ERR_NET_UNKNOWN_HOST;
-    for( cur = addr_list; cur != NULL; cur = cur->ai_next )
-    {
-        ctx->fd = (int) socket( cur->ai_family, cur->ai_socktype,
-                            cur->ai_protocol );
-        if( ctx->fd < 0 )
-        {
-            ret = MBEDTLS_ERR_NET_SOCKET_FAILED;
-            continue;
-        }
-
-        n = 1;
-        if( setsockopt( ctx->fd, SOL_SOCKET, SO_REUSEADDR,
-                        (const char *) &n, sizeof( n ) ) != 0 )
-        {
-            close( ctx->fd );
-            ret = MBEDTLS_ERR_NET_SOCKET_FAILED;
-            continue;
-        }
-
-        if( bind( ctx->fd, cur->ai_addr, MSVC_INT_CAST cur->ai_addrlen ) != 0 )
-        {
-            close( ctx->fd );
-            ret = MBEDTLS_ERR_NET_BIND_FAILED;
-            continue;
-        }
-
-        /* Listen only makes sense for TCP */
-        if( proto == MBEDTLS_NET_PROTO_TCP )
-        {
-            if( listen( ctx->fd, MBEDTLS_NET_LISTEN_BACKLOG ) != 0 )
-            {
-                close( ctx->fd );
-                ret = MBEDTLS_ERR_NET_LISTEN_FAILED;
-                continue;
-            }
-        }
-
-        /* Bind was successful */
-        ret = 0;
-        break;
+    
+    ctx->fd = (int) socket( AF_INET, proto == MBEDTLS_NET_PROTO_UDP ? SOCK_DGRAM : SOCK_STREAM,
+                        proto == MBEDTLS_NET_PROTO_UDP ? IPPROTO_UDP : IPPROTO_TCP );
+    if( ctx->fd < 0 )
+    {        
+        ret = MBEDTLS_ERR_NET_SOCKET_FAILED;
+        return ret;
     }
 
-    freeaddrinfo( addr_list );
+    n = 1;
+    if( setsockopt( ctx->fd, SOL_SOCKET, SO_REUSEADDR,
+                    (const char *) &n, sizeof( n ) ) != 0 )
+    {        
+        close( ctx->fd );
+        ret = MBEDTLS_ERR_NET_SOCKET_FAILED;
+        return ret;
+    }
+
+    remotehost.sin_family       = AF_INET;
+    if(bind_ip != NULL) {
+        remotehost.sin_addr.s_addr = inet_addr(bind_ip);
+    } else {
+        remotehost.sin_addr.s_addr = htonl(INADDR_ANY);
+    }
+    remotehost.sin_port         = htons(atoi(port));
+
+    if( bind( ctx->fd, (struct sockaddr *) &remotehost, MSVC_INT_CAST sizeof(remotehost) ) != 0 )
+    {
+        close( ctx->fd );
+        ret = MBEDTLS_ERR_NET_BIND_FAILED;
+        return ret;
+    }
+
+    /* Listen only makes sense for TCP */
+    if( proto == MBEDTLS_NET_PROTO_TCP )
+    {
+        if( listen( ctx->fd, MBEDTLS_NET_LISTEN_BACKLOG ) != 0 )
+        {
+            close( ctx->fd );
+            ret = MBEDTLS_ERR_NET_LISTEN_FAILED;
+            return ret;
+        }
+    }
+
+    /* Bind was successful */
+    ret = 0;        
+    
+    //freeaddrinfo( addr_list );
 
     return( ret );
 
@@ -315,11 +318,14 @@ int mbedtls_net_accept( mbedtls_net_context *bind_ctx,
 {
     int ret;
     int type;
+    
+    struct sockaddr_in client_addr;
 
-    struct sockaddr_storage client_addr;
-
+//Does not work for some reason
 #if defined(__socklen_t_defined) || defined(_SOCKLEN_T) ||  \
     defined(_SOCKLEN_T_DECLARED) || defined(__DEFINED_socklen_t)
+#endif
+#if 1
     socklen_t n = (socklen_t) sizeof( client_addr );
     socklen_t type_len = (socklen_t) sizeof( type );
 #else
@@ -337,9 +343,14 @@ int mbedtls_net_accept( mbedtls_net_context *bind_ctx,
 
     if( type == SOCK_STREAM )
     {
+        mbedtls_printf("waiting for connections.\n");
         /* TCP: actual accept() */
         ret = client_ctx->fd = (int) accept( bind_ctx->fd,
                                              (struct sockaddr *) &client_addr, &n );
+        if(ret < 0) {
+            //errno = Errno();
+            mbedtls_printf("ret %d errno: %d\n", ret, errno);
+        }
     }
     else
     {
@@ -371,7 +382,7 @@ int mbedtls_net_accept( mbedtls_net_context *bind_ctx,
      * then bind a new socket to accept new connections */
     if( type != SOCK_STREAM )
     {
-        struct sockaddr_storage local_addr;
+        struct sockaddr_in local_addr;
         int one = 1;
 
         if( connect( bind_ctx->fd, (struct sockaddr *) &client_addr, n ) != 0 )
@@ -380,10 +391,10 @@ int mbedtls_net_accept( mbedtls_net_context *bind_ctx,
         client_ctx->fd = bind_ctx->fd;
         bind_ctx->fd   = -1; /* In case we exit early */
 
-        n = sizeof( struct sockaddr_storage );
+        n = sizeof( struct sockaddr_in );
         if( getsockname( client_ctx->fd,
                          (struct sockaddr *) &local_addr, &n ) != 0 ||
-            ( bind_ctx->fd = (int) socket( local_addr.ss_family,
+            ( bind_ctx->fd = (int) socket( AF_INET,
                                            SOCK_DGRAM, IPPROTO_UDP ) ) < 0 ||
             setsockopt( bind_ctx->fd, SOL_SOCKET, SO_REUSEADDR,
                         (const char *) &one, sizeof( one ) ) != 0 )
@@ -399,7 +410,7 @@ int mbedtls_net_accept( mbedtls_net_context *bind_ctx,
 
     if( client_ip != NULL )
     {
-        if( client_addr.ss_family == AF_INET )
+        //if( client_addr.ss_family == AF_INET )        
         {
             struct sockaddr_in *addr4 = (struct sockaddr_in *) &client_addr;
             *ip_len = sizeof( addr4->sin_addr.s_addr );
@@ -409,16 +420,16 @@ int mbedtls_net_accept( mbedtls_net_context *bind_ctx,
 
             memcpy( client_ip, &addr4->sin_addr.s_addr, *ip_len );
         }
-        else
-        {
-            struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *) &client_addr;
-            *ip_len = sizeof( addr6->sin6_addr.s6_addr );
+        // else
+        // {
+        //     struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *) &client_addr;
+        //     *ip_len = sizeof( addr6->sin6_addr.s6_addr );
 
-            if( buf_size < *ip_len )
-                return( MBEDTLS_ERR_NET_BUFFER_TOO_SMALL );
+        //     if( buf_size < *ip_len )
+        //         return( MBEDTLS_ERR_NET_BUFFER_TOO_SMALL );
 
-            memcpy( client_ip, &addr6->sin6_addr.s6_addr, *ip_len);
-        }
+        //     memcpy( client_ip, &addr6->sin6_addr.s6_addr, *ip_len);
+        // }
     }
 
     return( 0 );
